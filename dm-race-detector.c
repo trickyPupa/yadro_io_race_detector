@@ -18,7 +18,7 @@ struct pending_bio
 	bool is_write;
 };
 
-struct race_detector_private
+struct race_detector_c
 {
 	struct dm_dev *dev;
 	spinlock_t lock;
@@ -28,36 +28,35 @@ struct race_detector_private
 
 static int race_detector_ctr(struct dm_target *ti, unsigned int argc, char **argv)
 {
-	struct race_detector_private *priv;
+	struct race_detector_c *rdc;
 	int ret;
 
 	if (argc != 1)
 	{
-		ti->error = "Неверное число аргументов: требуется путь к устройству";
+		ti->error = "Invalid argument count";
 		return -EINVAL;
 	}
 
-	priv = kzalloc(sizeof(*priv), GFP_KERNEL);
-	if (!priv)
+	rdc = kzalloc(sizeof(*rdc), GFP_KERNEL);
+	if (!rdc)
 	{
-		ti->error = "Не удалось выделить память";
+		ti->error = "Cannot allocate context";
 		return -ENOMEM;
 	}
 
-	ret = dm_get_device(ti, argv[0],
-						dm_table_get_mode(ti->table), &priv->dev);
+	ret = dm_get_device(ti, argv[0], dm_table_get_mode(ti->table), &rdc->dev);
 	if (ret)
 	{
-		ti->error = "Не удалось открыть нижележащее устройство";
-		kfree(priv);
+		ti->error = "Device lookup failed";
+		kfree(rdc);
 		return ret;
 	}
 
-	spin_lock_init(&priv->lock);
-	INIT_LIST_HEAD(&priv->pending_list);
-	priv->race_count = 0;
+	spin_lock_init(&rdc->lock);
+	INIT_LIST_HEAD(&rdc->pending_list);
+	rdc->race_count = 0;
 
-	ti->private = priv;
+	ti->private = rdc;
 	ti->num_flush_bios = 1;
 	ti->num_discard_bios = 1;
 	ti->num_secure_erase_bios = 1;
@@ -66,44 +65,50 @@ static int race_detector_ctr(struct dm_target *ti, unsigned int argc, char **arg
 	return 0;
 }
 
-
 static void race_detector_dtr(struct dm_target *ti)
 {
-	struct race_detector_private *priv = ti->private;
+	struct race_detector_c *rdc = ti->private;
 	struct pending_bio *pb, *tmp;
 
-	spin_lock(&priv->lock);
-	list_for_each_entry_safe(pb, tmp, &priv->pending_list, list)
+	spin_lock(&rdc->lock);
+	list_for_each_entry_safe(pb, tmp, &rdc->pending_list, list)
 	{
 		list_del(&pb->list);
 		kfree(pb);
 	}
-	spin_unlock(&priv->lock);
+	spin_unlock(&rdc->lock);
 
-	dm_put_device(ti, priv->dev);
-	kfree(priv);
+	dm_put_device(ti, rdc->dev);
+	kfree(rdc);
 }
 
 static int race_detector_map(struct dm_target *ti, struct bio *bio)
 {
-	struct race_detector_private *priv = ti->private;
+	struct race_detector_c *rdc = ti->private;
 	struct pending_bio *pb, *tmp;
 	sector_t start, end;
 	bool is_write;
 
-	if (bio_op(bio) != REQ_OP_READ && bio_op(bio) != REQ_OP_WRITE)
-	{
-		bio_set_dev(bio, priv->dev->bdev);
-		return DM_MAPIO_REMAPPED;
-	}
+	switch (bio_op(bio)) {
+    case REQ_OP_READ:
+        is_write = false;
+        break;
+    case REQ_OP_WRITE:
+    case REQ_OP_WRITE_ZEROES:
+        is_write = true;
+        break;
+    default:
+        bio_set_dev(bio, rdc->dev->bdev);
+        return DM_MAPIO_REMAPPED;
+    }
 
 	start = bio->bi_iter.bi_sector;
 	end = start + (bio->bi_iter.bi_size >> SECTOR_SHIFT);
-	is_write = (bio_op(bio) == REQ_OP_WRITE);
 
 	pb = kmalloc(sizeof(*pb), GFP_NOIO);
 	if (!pb)
 	{
+		DMINFO("Cannot allocate pending_bio context");
 		return DM_MAPIO_KILL;
 	}
 
@@ -111,10 +116,10 @@ static int race_detector_map(struct dm_target *ti, struct bio *bio)
 	pb->end = end;
 	pb->is_write = is_write;
 
-	spin_lock(&priv->lock);
+	spin_lock(&rdc->lock);
 
 	// Проверка гонок
-	list_for_each_entry(tmp, &priv->pending_list, list)
+	list_for_each_entry(tmp, &rdc->pending_list, list)
 	{
 		if (start < tmp->end && end > tmp->start)
 		{
@@ -132,24 +137,23 @@ static int race_detector_map(struct dm_target *ti, struct bio *bio)
 
 			if (conflict)
 			{
-				priv->race_count++;
-				DMWARN("Data race detected! Sector range [%llu, %llu] conflicts "
-					   "with in-flight %s on [%llu, %llu] (total races: %lu)",
-					   start, end - 1,
-					   tmp->is_write ? "WRITE" : "READ",
-					   tmp->start, tmp->end - 1,
-					   priv->race_count);
+				rdc->race_count++;
+				DMWARN("Data race detected! [%llu,%llu] conflicts with %s [%llu,%llu] (total: %lu)",
+					start, end - 1,
+					tmp->is_write ? "WRITE" : "READ",
+					tmp->start, tmp->end - 1,
+					rdc->race_count);
 				break;
 			}
 		}
 	}
 
-	list_add_tail(&pb->list, &priv->pending_list);
-	spin_unlock(&priv->lock);
+	list_add_tail(&pb->list, &rdc->pending_list);
+	spin_unlock(&rdc->lock);
 
 	bio->bi_private = pb;
 
-	bio_set_dev(bio, priv->dev->bdev);
+	bio_set_dev(bio, rdc->dev->bdev);
 
 	return DM_MAPIO_REMAPPED;
 }
@@ -157,15 +161,15 @@ static int race_detector_map(struct dm_target *ti, struct bio *bio)
 static int race_detector_end_io(struct dm_target *ti, struct bio *bio,
 								blk_status_t *error)
 {
-	struct race_detector_private *priv = ti->private;
+	struct race_detector_c *rdc = ti->private;
 	struct pending_bio *pb = bio->bi_private;
 
 	if (!pb)
 		return DM_ENDIO_DONE;
 
-	spin_lock(&priv->lock);
+	spin_lock(&rdc->lock);
 	list_del(&pb->list);
-	spin_unlock(&priv->lock);
+	spin_unlock(&rdc->lock);
 
 	kfree(pb);
 
